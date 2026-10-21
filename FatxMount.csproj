@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>12</LangVersion>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <RootNamespace>FatxMount</RootNamespace>
+    <AssemblyName>FatxMount</AssemblyName>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Needs the matching Dokany 2.x driver installed: https://github.com/dokan-dev/dokany/releases -->
+    <PackageReference Include="DokanNet" Version="2.1.0" />
+  </ItemGroup>
+
+</Project>
