@@ -31,7 +31,8 @@ public sealed class FatxVolume
     public const int MaxNameLength = 42;
     private const int Header = 0x1000;
     private const byte DeletedMark = 0xE5;
-
+    private long _bytesSinceLastFlush = 0;
+    private const long FlushThreshold = 64 * 1024 * 1024;
     private readonly BlockDevice _dev;
     private readonly bool _fat32;
     private readonly long _fatOff;
@@ -554,6 +555,17 @@ public sealed class FatxVolume
             int ci = (int)(pos / ClusterSize), co = (int)(pos % ClusterSize);
             int run = Math.Min(data.Length - done, (int)ClusterSize - co);
             int k = ci;
+            _bytesSinceLastFlush += run;
+
+            if (_bytesSinceLastFlush >= FlushThreshold)
+            {
+                _dev.Flush();
+
+                System.Threading.Thread.Yield();
+                System.Threading.Thread.Sleep(5);
+
+                _bytesSinceLastFlush = 0;
+            }
             while (done + run < data.Length && k + 1 < chain.Count && chain[k + 1] == chain[k] + 1)
             {
                 k++;
