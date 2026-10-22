@@ -28,3 +28,6 @@ FatxMount create-image test.img 128          # blank scratch image; mount it wit
 - Back up the drive before the first write. This is new, lightly-tested code.
 - Windows may offer to "initialize" the Xbox disk. Decline; if writes are refused, set the disk Offline in Disk Management.
 - FATX limits: 42-char ASCII names, 4 GiB max file size, no ACLs/streams/links.
+
+## VirusTotal
+- https://www.virustotal.com/gui/file/d5b8d5bc3a3298052c678670b6d5a2526834b91f7b90db51a054b7e51264fe90/details
