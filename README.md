@@ -1,4 +1,4 @@
-# FatxMount 1.0
+# FatxMount 1.2.0
 
 Mounts an original Xbox (FATX) or Xbox 360 (XTAF) partition as a read/write drive letter in Windows Explorer,
 using [Dokany 2.x](https://github.com/dokan-dev/dokany/releases) and the `DokanNet` package. It can also format
