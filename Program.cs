@@ -64,7 +64,7 @@ internal static class Program
         Command line (run from an elevated terminal):
           FatxMount list <disk>
           FatxMount mount <disk> (--partition X|Y|Z|C|E|Data360 | --offset N [--size N])
-                         [--drive Z] [--readonly]
+                         [--drive Z] [--readonly] [--nojournal]
           FatxMount create-image <file.img> <sizeMB> [--x360]
 
         <disk> = disk number (e.g. 2), \\.\PhysicalDrive2, or a raw image file. Numbers accept 0x-hex.
@@ -95,10 +95,11 @@ internal static class Program
     {
         string path = a[1];
         long mb = long.Parse(a[2]);
+        bool x360 = Flag(a, "--x360");
         using (var fs = File.Create(path)) fs.SetLength(mb << 20);
         using var dev = BlockDevice.Open(path, writable: true);
-        var vol = FatxVolume.Format(dev, 0, dev.Length, Flag(a, "--x360"));
-        Console.WriteLine($"Created {path}: {vol.Flavor}, {vol.ClusterCount} clusters of {vol.ClusterSize} bytes");
+        var (clusters, clusterSize) = FatxVolume.Format(dev, 0, dev.Length, x360);
+        Console.WriteLine($"Created {path}: {(x360 ? "XTAF (Xbox 360)" : "FATX (original Xbox)")}, {clusters} clusters of {clusterSize} bytes");
         return 0;
     }
 
@@ -122,7 +123,9 @@ internal static class Program
         }
         if (Opt(a, "--size") is { } s) size = Num(s);
 
-        using var session = MountSession.Start(a[1], name, off, size, ro, drive);
+        using var session = MountSession.Start(a[1], name, off, size, ro, drive, journaling: !Flag(a, "--nojournal"));
+        if (session.Volume.RecoveredTransactions > 0)
+            Console.WriteLine($"Recovered {session.Volume.RecoveredTransactions} pending transaction(s) from the journal.");
         Console.WriteLine($"{session.Volume.Flavor}: mounted on {session.MountPoint} ({(ro ? "read-only" : "read/write")}). Ctrl+C to unmount.");
 
         using var quit = new ManualResetEventSlim();

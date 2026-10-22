@@ -10,6 +10,7 @@ internal static class Nt
     public static readonly NtStatus BadPathName = unchecked((NtStatus)0xC0000033);   // STATUS_OBJECT_NAME_INVALID
     public static readonly NtStatus DiskFull = unchecked((NtStatus)0xC000007F);      // STATUS_DISK_FULL
     public static readonly NtStatus InternalError = unchecked((NtStatus)0xC00000E5); // STATUS_INTERNAL_ERROR
+    public static readonly NtStatus FileTooLarge = unchecked((NtStatus)0xC0000904);  // STATUS_FILE_TOO_LARGE
 }
 
 /// <summary>Bridges Dokan callbacks (Windows Explorer) to <see cref="FatxVolume"/>.</summary>
@@ -34,6 +35,7 @@ public sealed class FatxFileSystem : IDokanOperations
     {
         try { lock (_gate) return body(); }
         catch (FatxDiskFullException) { return Nt.DiskFull; }
+        catch (FatxFileTooLargeException) { return Nt.FileTooLarge; }
         catch (FatxBadNameException) { return Nt.BadPathName; }
         catch (FatxExistsException) { return DokanResult.FileExists; }
         catch (FatxNotEmptyException) { return DokanResult.DirectoryNotEmpty; }

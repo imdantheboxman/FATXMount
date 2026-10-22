@@ -103,10 +103,12 @@ public sealed class BlockDevice : IDisposable
         RandomAccess.Write(_h, tmp, start);
     }
 
-    public void Flush()
+    /// <summary>Flushes OS buffers to the device. Returns false if the device did not confirm.</summary>
+    public bool Flush()
     {
-        if (!Writable) return;
-        try { RandomAccess.FlushToDisk(_h); } catch { /* some raw devices don't support it */ }
+        if (!Writable) return true;
+        try { RandomAccess.FlushToDisk(_h); return true; }
+        catch (Exception ex) { CrashLog.Write("Device flush failed: " + ex.Message); return false; }
     }
 
     private void ReadExact(long pos, Span<byte> buf)

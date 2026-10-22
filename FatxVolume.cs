@@ -8,6 +8,7 @@ public sealed class FatxDiskFullException : FatxException { public FatxDiskFullE
 public sealed class FatxExistsException : FatxException { public FatxExistsException() : base("Name already exists") { } }
 public sealed class FatxNotEmptyException : FatxException { public FatxNotEmptyException() : base("Directory not empty") { } }
 public sealed class FatxBadNameException : FatxException { public FatxBadNameException(string n) : base($"Invalid FATX name: '{n}'") { } }
+public sealed class FatxFileTooLargeException : FatxException { public FatxFileTooLargeException() : base("FATX files are limited to 4 GiB - 1") { } }
 
 public sealed class DirEntry
 {
@@ -24,16 +25,22 @@ public sealed class DirEntry
 /// <summary>
 /// FATX (original Xbox, little-endian "FATX") and XTAF (Xbox 360, big-endian) volume.
 /// NOT thread-safe: callers must serialise access.
+///
+/// Crash safety: every public mutating operation is one transaction. FAT blocks and directory entries are
+/// collected, written to the write-ahead <see cref="Journal"/> (flushed), and only then applied to the disk.
+/// File data is written first (ordered mode). Extending a file is instant: new space is zeroed lazily
+/// (tracked as a "valid data length") instead of being written up front, which is what caused Dokan
+/// request timeouts on multi-GB copies.
 /// </summary>
-public sealed class FatxVolume
+public sealed class FatxVolume : IDisposable
 {
     public const int DirEntrySize = 64;
     public const int MaxNameLength = 42;
     private const int Header = 0x1000;
     private const byte DeletedMark = 0xE5;
-    private long _bytesSinceLastFlush = 0;
-    private const long FlushThreshold = 64 * 1024 * 1024;
+
     private readonly BlockDevice _dev;
+    private readonly Journal? _journal;
     private readonly bool _fat32;
     private readonly long _fatOff;
     private readonly long _dataOff;          // absolute offset of cluster 1
@@ -41,8 +48,12 @@ public sealed class FatxVolume
     private readonly HashSet<int> _dirtyFat = new();
     private readonly Dictionary<uint, List<uint>> _chains = new();
     private readonly Dictionary<uint, List<DirEntry>> _dirs = new();
+    private readonly Dictionary<uint, (long valid, long size)> _valid = new();   // first cluster -> valid data length
+    private readonly List<PendingWrite> _pending = new();
     private readonly int _epc;               // directory entries per cluster
+    private int _txnDepth;
     private uint _freeHint = 1;
+    private bool _disposed;
 
     public bool BigEndian { get; }
     public uint ClusterSize { get; }
@@ -50,6 +61,8 @@ public sealed class FatxVolume
     public uint FreeClusters { get; private set; }
     public uint VolumeId { get; }
     public DirEntry Root { get; }
+    public bool Journaled => _journal != null;
+    public int RecoveredTransactions { get; }
     public string Flavor => BigEndian ? "Xbox 360 (XTAF, big-endian)" : "Original Xbox (FATX, little-endian)";
 
     private int Epoch => BigEndian ? 1980 : 2000;
@@ -70,7 +83,7 @@ public sealed class FatxVolume
 
     public static bool HasSignature(BlockDevice dev, long off) => GetSignature(dev, off) != null;
 
-    public static FatxVolume Open(BlockDevice dev, long partOff, long partSize)
+    public static FatxVolume Open(BlockDevice dev, long partOff, long partSize, bool journaling = false)
     {
         if (partOff < 0 || partSize <= 0 || partOff + partSize > dev.Length)
             throw new FatxException("Partition range lies outside the device");
@@ -89,15 +102,30 @@ public sealed class FatxVolume
         if (spc == 0 || (spc & (spc - 1)) != 0 || spc > 256)
             throw new FatxException($"Implausible sectors-per-cluster value {spc}");
 
-        return new FatxVolume(dev, partOff, partSize, be, volId, spc);
+        Journal? journal = null;
+        int recovered = 0;
+        if (journaling && dev.Writable)
+        {
+            journal = Journal.Open(Journal.PathFor(dev.Description, partOff, volId), volId);
+            try
+            {
+                recovered = journal.Replay(dev);     // must happen before the FAT is read
+                if (recovered > 0) CrashLog.Write($"Journal: replayed {recovered} transaction(s) after an unclean shutdown");
+            }
+            catch { journal.Dispose(); throw; }
+        }
+
+        try { return new FatxVolume(dev, partOff, partSize, be, volId, spc, journal, recovered); }
+        catch { journal?.Dispose(); throw; }
     }
 
-    /// <summary>Writes an empty filesystem. Intended for image files / testing.</summary>
-    public static FatxVolume Format(BlockDevice dev, long partOff, long partSize, bool bigEndian,
-                                    uint sectorsPerCluster = 32, uint volumeId = 0x46415458)
+    /// <summary>Writes an empty filesystem (header, FAT, empty root). Existing file data is left in place but unreachable.</summary>
+    public static (uint clusters, uint clusterSize) Format(BlockDevice dev, long partOff, long partSize, bool bigEndian,
+                                                           uint sectorsPerCluster = 32, uint volumeId = 0)
     {
+        if (volumeId == 0) volumeId = (uint)Random.Shared.NextInt64(1, uint.MaxValue);
         uint cs = sectorsPerCluster * 512;
-        Geometry(partSize, cs, out bool fat32, out long fatBytes, out _);
+        Geometry(partSize, cs, bigEndian, out bool fat32, out long fatBytes, out uint usable);
 
         var hdr = new byte[Header];
         Array.Fill(hdr, (byte)0xFF);
@@ -116,39 +144,51 @@ public sealed class FatxVolume
         }
         dev.Write(partOff, hdr);
 
-        var fat = new byte[fatBytes];
+        // FAT: first block carries the media descriptor and the root-directory end-of-chain, the rest is zero.
+        var first = new byte[Header];
         void Put(int idx, uint v)
         {
-            if (fat32) { if (bigEndian) BinaryPrimitives.WriteUInt32BigEndian(fat.AsSpan(idx * 4), v); else BinaryPrimitives.WriteUInt32LittleEndian(fat.AsSpan(idx * 4), v); }
-            else { if (bigEndian) BinaryPrimitives.WriteUInt16BigEndian(fat.AsSpan(idx * 2), (ushort)v); else BinaryPrimitives.WriteUInt16LittleEndian(fat.AsSpan(idx * 2), (ushort)v); }
+            if (fat32) { if (bigEndian) BinaryPrimitives.WriteUInt32BigEndian(first.AsSpan(idx * 4), v); else BinaryPrimitives.WriteUInt32LittleEndian(first.AsSpan(idx * 4), v); }
+            else { if (bigEndian) BinaryPrimitives.WriteUInt16BigEndian(first.AsSpan(idx * 2), (ushort)v); else BinaryPrimitives.WriteUInt16LittleEndian(first.AsSpan(idx * 2), (ushort)v); }
         }
-        Put(0, fat32 ? 0xFFFFFFF8u : 0xFFF8u);   // media descriptor
-        Put(1, fat32 ? 0xFFFFFFFFu : 0xFFFFu);   // root directory: single cluster
-        dev.Write(partOff + Header, fat);
+        Put(0, fat32 ? 0xFFFFFFF8u : 0xFFF8u);
+        Put(1, fat32 ? 0xFFFFFFFFu : 0xFFFFu);
+        dev.Write(partOff + Header, first);
+
+        long done = Header;
+        var zeros = new byte[4 << 20];
+        while (done < fatBytes)
+        {
+            int n = (int)Math.Min(zeros.Length, fatBytes - done);
+            dev.Write(partOff + Header + done, zeros.AsSpan(0, n));
+            done += n;
+        }
 
         var root = new byte[cs];
         Array.Fill(root, (byte)0xFF);
         dev.Write(partOff + Header + fatBytes, root);
-
-        return Open(dev, partOff, partSize);
+        dev.Flush();
+        return (usable, cs);
     }
 
-    private static void Geometry(long partSize, uint clusterSize, out bool fat32, out long fatBytes, out uint usableClusters)
+    private static void Geometry(long partSize, uint clusterSize, bool bigEndian, out bool fat32, out long fatBytes, out uint usableClusters)
     {
         long total = partSize / clusterSize;
-        fat32 = total >= 0xFFF0;
+        fat32 = total >= (bigEndian ? 0xFFF4 : 0xFFF0);
         long entries = total + 1; // entry 0 is reserved
         fatBytes = (entries * (fat32 ? 4 : 2) + (Header - 1)) & ~(long)(Header - 1);
         usableClusters = (uint)((partSize - Header - fatBytes) / clusterSize);
     }
 
-    private FatxVolume(BlockDevice dev, long partOff, long partSize, bool be, uint volId, uint spc)
+    private FatxVolume(BlockDevice dev, long partOff, long partSize, bool be, uint volId, uint spc, Journal? journal, int recovered)
     {
         _dev = dev;
+        _journal = journal;
+        RecoveredTransactions = recovered;
         BigEndian = be;
         VolumeId = volId;
         ClusterSize = spc * 512;
-        Geometry(partSize, ClusterSize, out _fat32, out long fatBytes, out uint usable);
+        Geometry(partSize, ClusterSize, be, out _fat32, out long fatBytes, out uint usable);
         ClusterCount = usable;
         _fatOff = partOff + Header;
         _dataOff = _fatOff + fatBytes;
@@ -171,6 +211,106 @@ public sealed class FatxVolume
     private void W16(Span<byte> s, ushort v) { if (BigEndian) BinaryPrimitives.WriteUInt16BigEndian(s, v); else BinaryPrimitives.WriteUInt16LittleEndian(s, v); }
     private void W32(Span<byte> s, uint v) { if (BigEndian) BinaryPrimitives.WriteUInt32BigEndian(s, v); else BinaryPrimitives.WriteUInt32LittleEndian(s, v); }
 
+    // ------------------------------------------------------------------ transactions / journal
+
+    private void Begin() => _txnDepth++;
+
+    private void End()
+    {
+        if (--_txnDepth > 0) return;
+        _txnDepth = 0;
+        CommitPending();
+    }
+
+    /// <summary>Throws away an unfinished transaction and restores the in-memory FAT from the disk.</summary>
+    private void Abort()
+    {
+        _txnDepth = 0;
+        _pending.Clear();
+        try
+        {
+            long before = 0, after = 0;
+            foreach (int b in _dirtyFat)
+            {
+                before += CountFree(b);
+                _dev.Read(_fatOff + (long)b * Header, _fat.AsSpan(b * Header, Header));
+                after += CountFree(b);
+            }
+            FreeClusters = (uint)Math.Max(0, FreeClusters - before + after);
+        }
+        catch (Exception ex) { CrashLog.Write("Abort: could not restore FAT blocks: " + ex.Message); }
+        _dirtyFat.Clear();
+        _chains.Clear();
+        _dirs.Clear();
+    }
+
+    private uint CountFree(int block)
+    {
+        int per = Header / (_fat32 ? 4 : 2);
+        uint n = 0;
+        for (int i = 0; i < per; i++)
+        {
+            long c = (long)block * per + i;
+            if (c < 1 || c > ClusterCount) continue;
+            if (GetFat((uint)c) == 0) n++;
+        }
+        return n;
+    }
+
+    private void MetaWrite(long off, byte[] data)
+    {
+        if (_txnDepth == 0) { _dev.Write(off, data); return; }
+        _pending.Add(new PendingWrite(off, data));
+    }
+
+    private void CommitPending()
+    {
+        foreach (int b in _dirtyFat)
+            _pending.Add(new PendingWrite(_fatOff + (long)b * Header, _fat.AsSpan(b * Header, Header).ToArray()));
+        if (_pending.Count == 0) { _dirtyFat.Clear(); return; }
+        try
+        {
+            _journal?.Append(_pending);                        // durable BEFORE the disk is touched
+            foreach (var w in _pending) _dev.Write(w.Offset, w.Data);
+            _journal?.MaybeCheckpoint(_dev);
+        }
+        finally
+        {
+            _pending.Clear();
+            _dirtyFat.Clear();
+        }
+    }
+
+    /// <summary>Makes directory reads inside a transaction see writes that are queued but not yet applied.</summary>
+    private void Overlay(long off, Span<byte> buf)
+    {
+        foreach (var w in _pending)
+        {
+            long s = Math.Max(off, w.Offset), e = Math.Min(off + buf.Length, w.Offset + w.Data.Length);
+            if (s < e) w.Data.AsSpan((int)(s - w.Offset), (int)(e - s)).CopyTo(buf.Slice((int)(s - off)));
+        }
+    }
+
+    /// <summary>Forces applied writes to the disk and empties the journal.</summary>
+    public void Flush()
+    {
+        if (_journal != null) _journal.Checkpoint(_dev); else _dev.Flush();
+    }
+
+    /// <summary>Zero-fills any lazily extended file tails, then checkpoints. Call before unmounting.</summary>
+    public void Close()
+    {
+        FinalizeAll();
+        Flush();
+    }
+
+    public void Dispose()
+    {
+        if (_disposed) return;
+        _disposed = true;
+        _journal?.Dispose();
+    }
+
     // ------------------------------------------------------------------ FAT
 
     private uint GetFat(uint c) => _fat32 ? R32(_fat.AsSpan((int)(c * 4))) : R16(_fat.AsSpan((int)(c * 2)));
@@ -185,15 +325,6 @@ public sealed class FatxVolume
         if (_fat32) W32(_fat.AsSpan(byteOff), v); else W16(_fat.AsSpan(byteOff), (ushort)v);
         _dirtyFat.Add(byteOff / Header);
     }
-
-    private void FlushFat()
-    {
-        foreach (int b in _dirtyFat)
-            _dev.Write(_fatOff + (long)b * Header, _fat.AsSpan(b * Header, Header));
-        _dirtyFat.Clear();
-    }
-
-    public void Flush() { FlushFat(); _dev.Flush(); }
 
     private long ClusterOffset(uint c) => _dataOff + (long)(c - 1) * ClusterSize;
 
@@ -233,8 +364,11 @@ public sealed class FatxVolume
         return list;
     }
 
-    /// <summary>Grows or shrinks a chain to exactly <paramref name="wanted"/> clusters. Returns the (possibly new) first cluster, 0 if empty.</summary>
-    private uint ResizeChain(uint first, int wanted, bool zeroNew = true, byte fill = 0)
+    /// <summary>
+    /// Grows or shrinks a chain to exactly <paramref name="wanted"/> clusters; returns the (possibly new) first
+    /// cluster, 0 if empty. New clusters are only written if <paramref name="fill"/> is given (directories).
+    /// </summary>
+    private uint ResizeChain(uint first, int wanted, byte? fill = null)
     {
         var chain = first == 0 ? new List<uint>() : Chain(first);
         if (wanted == chain.Count) return first;
@@ -251,11 +385,11 @@ public sealed class FatxVolume
         int need = wanted - chain.Count;
         var fresh = AllocateClusters(need);   // throws before anything is modified
 
-        if (zeroNew || fill != 0)
+        if (fill is byte f)
         {
             var buf = new byte[ClusterSize];
-            if (fill != 0) Array.Fill(buf, fill);
-            foreach (uint c in fresh) _dev.Write(ClusterOffset(c), buf);
+            Array.Fill(buf, f);
+            foreach (uint c in fresh) _dev.Write(ClusterOffset(c), buf);   // unreferenced until the transaction commits
         }
 
         if (chain.Count > 0) SetFat(chain[^1], fresh[0]);
@@ -352,7 +486,9 @@ public sealed class FatxVolume
         var buf = new byte[ClusterSize];
         for (int ci = 0; ci < chain.Count; ci++)
         {
-            _dev.Read(ClusterOffset(chain[ci]), buf);
+            long pos = ClusterOffset(chain[ci]);
+            _dev.Read(pos, buf);
+            if (_pending.Count > 0) Overlay(pos, buf);
             for (int i = 0; i < _epc; i++)
             {
                 byte len = buf[i * DirEntrySize];
@@ -379,13 +515,13 @@ public sealed class FatxVolume
     {
         var b = new byte[DirEntrySize];
         SerializeEntry(e, b);
-        _dev.Write(EntryPos(dir, idx), b);
+        MetaWrite(EntryPos(dir, idx), b);
         _dirs.Remove(dir);
     }
 
     private void MarkDeleted(uint dir, int idx)
     {
-        _dev.Write(EntryPos(dir, idx), new[] { DeletedMark });
+        MetaWrite(EntryPos(dir, idx), new[] { DeletedMark });
         _dirs.Remove(dir);
     }
 
@@ -395,7 +531,9 @@ public sealed class FatxVolume
         var buf = new byte[ClusterSize];
         for (int ci = 0; ci < chain.Count; ci++)
         {
-            _dev.Read(ClusterOffset(chain[ci]), buf);
+            long pos = ClusterOffset(chain[ci]);
+            _dev.Read(pos, buf);
+            if (_pending.Count > 0) Overlay(pos, buf);
             for (int i = 0; i < _epc; i++)
             {
                 byte len = buf[i * DirEntrySize];
@@ -403,7 +541,7 @@ public sealed class FatxVolume
             }
         }
         int oldCount = chain.Count;
-        ResizeChain(dir, oldCount + 1, zeroNew: false, fill: 0xFF);
+        ResizeChain(dir, oldCount + 1, fill: 0xFF);
         return oldCount * _epc;
     }
 
@@ -443,28 +581,24 @@ public sealed class FatxVolume
         if (!IsValidName(name)) throw new FatxBadNameException(name);
         if (FindInDir(parent.FirstCluster, name) != null) throw new FatxExistsException();
 
-        var now = DateTime.Now;
-        var e = new DirEntry
-        {
-            Name = name,
-            Attributes = directory ? (byte)0x10 : (byte)0x20,
-            Created = now, Written = now, Accessed = now,
-            ParentCluster = parent.FirstCluster
-        };
-        if (directory) e.FirstCluster = ResizeChain(0, 1, zeroNew: false, fill: 0xFF);
-
+        Begin();
         try
         {
+            var now = DateTime.Now;
+            var e = new DirEntry
+            {
+                Name = name,
+                Attributes = directory ? (byte)0x10 : (byte)0x20,
+                Created = now, Written = now, Accessed = now,
+                ParentCluster = parent.FirstCluster
+            };
+            if (directory) e.FirstCluster = ResizeChain(0, 1, fill: 0xFF);
             e.Index = FindFreeSlot(parent.FirstCluster);
+            WriteEntry(e.ParentCluster, e.Index, e);
+            End();
+            return e;
         }
-        catch
-        {
-            if (e.FirstCluster != 0) { ResizeChain(e.FirstCluster, 0); FlushFat(); }
-            throw;
-        }
-        FlushFat();                                   // data/FAT first,
-        WriteEntry(e.ParentCluster, e.Index, e);      // then the directory entry
-        return e;
+        catch { Abort(); throw; }
     }
 
     public void Delete(DirEntry e)
@@ -472,9 +606,18 @@ public sealed class FatxVolume
         if (e.Index < 0) throw new FatxException("Cannot delete the root directory");
         if (e.IsDirectory && ReadDir(e.FirstCluster).Count > 0) throw new FatxNotEmptyException();
 
-        MarkDeleted(e.ParentCluster, e.Index);        // entry first: a crash leaks clusters rather than corrupting
-        if (e.FirstCluster != 0) ResizeChain(e.FirstCluster, 0);
-        FlushFat();
+        Begin();
+        try
+        {
+            MarkDeleted(e.ParentCluster, e.Index);
+            if (e.FirstCluster != 0)
+            {
+                _valid.Remove(e.FirstCluster);
+                ResizeChain(e.FirstCluster, 0);
+            }
+            End();   // entry removal and cluster release commit together: no leaked clusters
+        }
+        catch { Abort(); throw; }
     }
 
     public void Move(DirEntry e, DirEntry newParent, string newName, bool replace)
@@ -482,57 +625,63 @@ public sealed class FatxVolume
         if (e.Index < 0) throw new FatxException("Cannot move the root directory");
         if (!IsValidName(newName)) throw new FatxBadNameException(newName);
 
-        var existing = FindInDir(newParent.FirstCluster, newName);
-        bool same = existing != null && existing.ParentCluster == e.ParentCluster && existing.Index == e.Index;
-        if (existing != null && !same)
+        Begin();
+        try
         {
-            if (!replace || existing.IsDirectory) throw new FatxExistsException();
-            Delete(existing);
-        }
+            var existing = FindInDir(newParent.FirstCluster, newName);
+            bool same = existing != null && existing.ParentCluster == e.ParentCluster && existing.Index == e.Index;
+            if (existing != null && !same)
+            {
+                if (!replace || existing.IsDirectory) throw new FatxExistsException();
+                Delete(existing);
+            }
 
-        if (newParent.FirstCluster == e.ParentCluster)
-        {
-            e.Name = newName;
-            WriteEntry(e.ParentCluster, e.Index, e);
+            if (newParent.FirstCluster == e.ParentCluster)
+            {
+                e.Name = newName;
+                WriteEntry(e.ParentCluster, e.Index, e);
+            }
+            else
+            {
+                int slot = FindFreeSlot(newParent.FirstCluster);
+                uint oldParent = e.ParentCluster; int oldIdx = e.Index;
+                e.Name = newName; e.ParentCluster = newParent.FirstCluster; e.Index = slot;
+                WriteEntry(e.ParentCluster, slot, e);
+                MarkDeleted(oldParent, oldIdx);
+            }
+            End();
         }
-        else
-        {
-            int slot = FindFreeSlot(newParent.FirstCluster);
-            uint oldParent = e.ParentCluster; int oldIdx = e.Index;
-            e.Name = newName; e.ParentCluster = newParent.FirstCluster; e.Index = slot;
-            FlushFat();
-            WriteEntry(e.ParentCluster, slot, e);
-            MarkDeleted(oldParent, oldIdx);
-        }
+        catch { Abort(); throw; }
     }
 
     /// <summary>Persist changed metadata (attributes, times, name...) of an entry.</summary>
     public void UpdateEntry(DirEntry e)
     {
         if (e.Index < 0) return;
-        WriteEntry(e.ParentCluster, e.Index, e);
+        Begin();
+        try { WriteEntry(e.ParentCluster, e.Index, e); End(); }
+        catch { Abort(); throw; }
     }
 
     // ------------------------------------------------------------------ file data
 
-    public int Read(DirEntry e, long offset, Span<byte> dest)
-    {
-        if (e.FirstCluster == 0 || offset >= e.Size) return 0;
-        int count = (int)Math.Min(dest.Length, e.Size - offset);
-        var chain = Chain(e.FirstCluster);
+    private long ValidOf(DirEntry e) =>
+        e.FirstCluster != 0 && _valid.TryGetValue(e.FirstCluster, out var v) ? v.valid : e.Size;
 
+    private int ReadChain(List<uint> chain, long offset, Span<byte> dest)
+    {
         int done = 0;
-        while (done < count)
+        while (done < dest.Length)
         {
             long pos = offset + done;
             int ci = (int)(pos / ClusterSize), co = (int)(pos % ClusterSize);
             if (ci >= chain.Count) break;   // corrupt chain: return what we have
-            int run = Math.Min(count - done, (int)ClusterSize - co);
+            int run = Math.Min(dest.Length - done, (int)ClusterSize - co);
             int k = ci;
-            while (done + run < count && k + 1 < chain.Count && chain[k + 1] == chain[k] + 1)
+            while (done + run < dest.Length && k + 1 < chain.Count && chain[k + 1] == chain[k] + 1)
             {
                 k++;
-                run += Math.Min(count - done - run, (int)ClusterSize);
+                run += Math.Min(dest.Length - done - run, (int)ClusterSize);
             }
             _dev.Read(ClusterOffset(chain[ci]) + co, dest.Slice(done, run));
             done += run;
@@ -540,32 +689,16 @@ public sealed class FatxVolume
         return done;
     }
 
-    public void Write(DirEntry e, long offset, ReadOnlySpan<byte> data)
+    private void WriteChain(List<uint> chain, long offset, ReadOnlySpan<byte> data)
     {
-        if (data.IsEmpty) return;
-        long end = offset + data.Length;
-        if (end > e.Size)
-            SetLength(e, end, zeroFill: offset > e.Size);   // only zero if a gap would be exposed
-
-        var chain = Chain(e.FirstCluster);
         int done = 0;
         while (done < data.Length)
         {
             long pos = offset + done;
             int ci = (int)(pos / ClusterSize), co = (int)(pos % ClusterSize);
+            if (ci >= chain.Count) throw new FatxException("Cluster chain is shorter than the file size");
             int run = Math.Min(data.Length - done, (int)ClusterSize - co);
             int k = ci;
-            _bytesSinceLastFlush += run;
-
-            if (_bytesSinceLastFlush >= FlushThreshold)
-            {
-                _dev.Flush();
-
-                System.Threading.Thread.Yield();
-                System.Threading.Thread.Sleep(5);
-
-                _bytesSinceLastFlush = 0;
-            }
             while (done + run < data.Length && k + 1 < chain.Count && chain[k + 1] == chain[k] + 1)
             {
                 k++;
@@ -576,27 +709,102 @@ public sealed class FatxVolume
         }
     }
 
-    public void SetLength(DirEntry e, long newLen, bool zeroFill = true)
+    private void ZeroRange(List<uint> chain, long from, long to)
+    {
+        if (to <= from) return;
+        var zeros = new byte[(int)Math.Min(to - from, 1 << 20)];
+        for (long pos = from; pos < to;)
+        {
+            int n = (int)Math.Min(zeros.Length, to - pos);
+            WriteChain(chain, pos, zeros.AsSpan(0, n));
+            pos += n;
+        }
+    }
+
+    public int Read(DirEntry e, long offset, Span<byte> dest)
+    {
+        if (e.FirstCluster == 0 || offset >= e.Size) return 0;
+        int count = (int)Math.Min(dest.Length, e.Size - offset);
+        long valid = ValidOf(e);
+        int fromDisk = (int)Math.Clamp(valid - offset, 0, count);
+
+        var chain = Chain(e.FirstCluster);
+        int got = ReadChain(chain, offset, dest.Slice(0, fromDisk));
+        if (got < fromDisk) return got;
+        if (fromDisk < count) dest.Slice(fromDisk, count - fromDisk).Clear();   // lazily extended region reads as zeros
+        return count;
+    }
+
+    public void Write(DirEntry e, long offset, ReadOnlySpan<byte> data)
+    {
+        if (data.IsEmpty) return;
+        long end = offset + data.Length;
+        if (end > uint.MaxValue) throw new FatxFileTooLargeException();
+
+        Begin();
+        try
+        {
+            if (end > e.Size) SetLengthCore(e, end);
+
+            long valid = ValidOf(e);
+            var chain = Chain(e.FirstCluster);
+            if (offset > valid) ZeroRange(chain, valid, offset);   // never expose stale disk contents in a gap
+            WriteChain(chain, offset, data);
+
+            long newValid = Math.Max(valid, end);
+            if (e.FirstCluster != 0)
+            {
+                if (newValid >= e.Size) _valid.Remove(e.FirstCluster);
+                else _valid[e.FirstCluster] = (newValid, e.Size);
+            }
+            End();   // data is already on the disk; now commit the metadata that references it
+        }
+        catch { Abort(); throw; }
+    }
+
+    public void SetLength(DirEntry e, long newLen)
+    {
+        Begin();
+        try { SetLengthCore(e, newLen); End(); }
+        catch { Abort(); throw; }
+    }
+
+    private void SetLengthCore(DirEntry e, long newLen)
     {
         if (e.IsDirectory) throw new FatxException("Not a file");
-        if (newLen < 0 || newLen > uint.MaxValue) throw new FatxException("FATX files are limited to 4 GiB - 1");
+        if (newLen < 0 || newLen > uint.MaxValue) throw new FatxFileTooLargeException();
 
-        if (zeroFill && newLen > e.Size && e.Size % ClusterSize != 0 && e.FirstCluster != 0)
-        {
-            // scrub stale bytes after the old EOF inside the last cluster
-            var ch = Chain(e.FirstCluster);
-            int ci = (int)(e.Size / ClusterSize);
-            if (ci < ch.Count)
-            {
-                int co = (int)(e.Size % ClusterSize);
-                _dev.Write(ClusterOffset(ch[ci]) + co, new byte[ClusterSize - co]);
-            }
-        }
-
+        long oldValid = ValidOf(e);
+        uint oldFirst = e.FirstCluster;
         int wanted = (int)((newLen + ClusterSize - 1) / ClusterSize);
-        e.FirstCluster = ResizeChain(e.FirstCluster, wanted, zeroNew: zeroFill);
+
+        uint first = ResizeChain(oldFirst, wanted);          // instant: no zero-filling here
+
+        if (oldFirst != 0) _valid.Remove(oldFirst);
+        e.FirstCluster = first;
         e.Size = (uint)newLen;
-        FlushFat();
-        UpdateEntry(e);
+
+        long newValid = Math.Min(oldValid, newLen);
+        if (first != 0 && newValid < newLen) _valid[first] = (newValid, newLen);
+
+        WriteEntry(e.ParentCluster, e.Index, e);
+    }
+
+    /// <summary>Zero-fills the never-written tail of one file (called when its last handle closes).</summary>
+    public void FinalizeFile(DirEntry e)
+    {
+        if (e.FirstCluster == 0 || !_valid.TryGetValue(e.FirstCluster, out var v)) return;
+        ZeroRange(Chain(e.FirstCluster), v.valid, v.size);
+        _valid.Remove(e.FirstCluster);
+    }
+
+    private void FinalizeAll()
+    {
+        foreach (var kv in _valid.ToList())
+        {
+            try { ZeroRange(Chain(kv.Key), kv.Value.valid, kv.Value.size); }
+            catch (Exception ex) { CrashLog.Write("FinalizeAll: " + ex.Message); }
+            _valid.Remove(kv.Key);
+        }
     }
 }
